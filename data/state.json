@@ -1,0 +1,21 @@
+{
+  "heroImage": "/uploads/her8-6.jpg",
+  "galleryState": {
+    "0": [
+      "/uploads/her.jpg",
+      "/uploads/her3.jpg",
+      "/uploads/her4.jpg",
+      "/uploads/her5.jpg",
+      "/uploads/her6.jpg"
+    ],
+    "1": [
+      "/uploads/her1.jpg",
+      "/uploads/her2.jpg"
+    ],
+    "2": [
+      "/uploads/her7-1.jpg",
+      "/uploads/her8.jpg",
+      "/uploads/her9.jpg"
+    ]
+  }
+}
