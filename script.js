@@ -1,3 +1,9 @@
+// Supabase-enabled script.js
+// Integrates Supabase Storage and Postgres to replace /api/* endpoints as the source of truth.
+// Preserves existing UI and localStorage fallback behavior.
+
+/* eslint-disable no-console */
+
 const revealBtn = document.querySelector('.reveal-btn');
 const hiddenMessage = document.getElementById('hiddenMessage');
 const imageModal = document.getElementById('imageModal');
@@ -28,7 +34,7 @@ const galleryContainerDefaultImages = [
 ];
 let currentGalleryTarget = 0;
 let activePopupContainer = 0;
-let serverAvailable = false;
+let serverAvailable = false; // kept name for backward compatibility; now indicates Supabase availability
 const deletedGalleryUrls = new Set();
 const loveSong = document.getElementById('loveSong');
 const progressBar = document.getElementById('progressBar');
@@ -43,6 +49,45 @@ const savedHeroImageKey = 'savedHeroImage';
 const topbar = document.querySelector('.topbar');
 const menuToggle = document.querySelector('.menu-toggle');
 const navLinks = document.querySelector('.nav-links');
+
+// Supabase client placeholder
+let supabaseClient = null;
+const GALLERY_BUCKET = 'gallery-images';
+const HERO_BUCKET = 'hero-images';
+
+function initSupabaseClient() {
+  try {
+    if (!window.SUPABASE_CONFIG || !window.SUPABASE_CONFIG.SUPABASE_URL || !window.SUPABASE_CONFIG.SUPABASE_ANON_KEY) {
+      console.warn('Supabase config not found. Create config.js from config.example.js with SUPABASE_URL and SUPABASE_ANON_KEY.');
+      return null;
+    }
+
+    if (typeof supabase === 'undefined' || typeof supabase.createClient !== 'function') {
+      console.warn('Supabase library not loaded. Make sure to include the Supabase CDN script in index.html.');
+      return null;
+    }
+
+    const { SUPABASE_URL, SUPABASE_ANON_KEY } = window.SUPABASE_CONFIG;
+    const client = supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+    return client;
+  } catch (err) {
+    console.error('Failed to initialize Supabase client:', err);
+    return null;
+  }
+}
+
+async function testSupabaseConnection(client) {
+  if (!client) return false;
+  try {
+    // Try a lightweight request to see if the DB can be reached
+    const { error } = await client.from('gallery_images').select('id').limit(1).maybeSingle();
+    if (error) throw error;
+    return true;
+  } catch (err) {
+    console.warn('Supabase test query failed:', err.message || err);
+    return false;
+  }
+}
 
 function toggleMenu() {
   navLinks.classList.toggle('active');
@@ -161,6 +206,102 @@ function applyDeletionFilter(state) {
   return filtered;
 }
 
+// Supabase-backed helpers
+async function fetchSupabaseGalleryState() {
+  if (!supabaseClient) return null;
+  try {
+    const { data, error } = await supabaseClient
+      .from('gallery_images')
+      .select('id, image_url, container_index, created_at, storage_path')
+      .order('created_at', { ascending: true });
+    if (error) throw error;
+    const normalized = { 0: [], 1: [], 2: [] };
+    data.forEach((row) => {
+      const idx = Number(row.container_index) || 0;
+      if (!Array.isArray(normalized[idx])) normalized[idx] = [];
+      normalized[idx].push({ url: row.image_url, id: row.id, storage_path: row.storage_path });
+    });
+    return normalized;
+  } catch (err) {
+    console.warn('Failed to fetch gallery state from Supabase:', err.message || err);
+    return null;
+  }
+}
+
+async function fetchSupabaseHero() {
+  if (!supabaseClient) return null;
+  try {
+    // site_settings table expected to have single row with id=1
+    const { data, error } = await supabaseClient.from('site_settings').select('id, hero_image_url').limit(1).maybeSingle();
+    if (error) throw error;
+    return data ? data.hero_image_url : null;
+  } catch (err) {
+    console.warn('Failed to fetch hero from Supabase:', err.message || err);
+    return null;
+  }
+}
+
+async function uploadFileToSupabaseStorage(bucket, path, file) {
+  if (!supabaseClient) throw new Error('Supabase client not initialized');
+  const { data, error } = await supabaseClient.storage.from(bucket).upload(path, file, { cacheControl: '3600', upsert: false });
+  if (error) throw error;
+  // get public url
+  const { data: urlData, error: urlErr } = supabaseClient.storage.from(bucket).getPublicUrl(path);
+  if (urlErr) throw urlErr;
+  return { publicUrl: urlData.publicUrl, storagePath: path };
+}
+
+function sanitizeFileName(filename) {
+  return filename.replace(/[^a-zA-Z0-9._-]/g, '_');
+}
+
+async function addGalleryImageRow(imageUrl, storagePath, containerIndex) {
+  if (!supabaseClient) throw new Error('Supabase client not initialized');
+  const payload = { image_url: imageUrl, storage_path: storagePath, container_index: containerIndex };
+  const { data, error } = await supabaseClient.from('gallery_images').insert(payload).select().single();
+  if (error) throw error;
+  return data;
+}
+
+async function uploadGalleryFile(file, containerIndex) {
+  const filename = `${Date.now()}_${sanitizeFileName(file.name)}`;
+  const path = `${containerIndex}/${filename}`;
+  const { publicUrl, storagePath } = await uploadFileToSupabaseStorage(GALLERY_BUCKET, path, file);
+  const row = await addGalleryImageRow(publicUrl, storagePath, containerIndex);
+  return { url: row.image_url, id: row.id, storage_path: row.storage_path };
+}
+
+async function uploadHeroFile(file) {
+  const filename = `${Date.now()}_${sanitizeFileName(file.name)}`;
+  const path = `hero/${filename}`;
+  const { publicUrl, storagePath } = await uploadFileToSupabaseStorage(HERO_BUCKET, path, file);
+  // upsert into site_settings (single row id=1)
+  const payload = { id: 1, hero_image_url: publicUrl };
+  const { data, error } = await supabaseClient.from('site_settings').upsert(payload, { returning: 'representation' }).select().single();
+  if (error) throw error;
+  return data.hero_image_url;
+}
+
+async function deleteGalleryRowAndFileByUrl(imageUrl) {
+  if (!supabaseClient) throw new Error('Supabase client not initialized');
+  try {
+    const { data: found, error: selectErr } = await supabaseClient.from('gallery_images').select('id, storage_path').eq('image_url', imageUrl).limit(1).maybeSingle();
+    if (selectErr) throw selectErr;
+    if (!found) return { removed: false };
+    // delete storage object if storage_path present
+    if (found.storage_path) {
+      const { error: delErr } = await supabaseClient.storage.from(GALLERY_BUCKET).remove([found.storage_path]);
+      if (delErr) console.warn('Failed to delete storage object:', delErr.message || delErr);
+    }
+    const { error: delRowErr } = await supabaseClient.from('gallery_images').delete().eq('id', found.id);
+    if (delRowErr) throw delRowErr;
+    return { removed: true };
+  } catch (err) {
+    console.warn('Failed to delete gallery row and file:', err.message || err);
+    return { removed: false, error: err };
+  }
+}
+
 async function syncDeletedGalleryUrlsToServer() {
   if (!serverAvailable || deletedGalleryUrls.size === 0) return false;
   const urlsToSync = Array.from(deletedGalleryUrls);
@@ -174,28 +315,22 @@ async function syncDeletedGalleryUrlsToServer() {
     }
 
     try {
-      const response = await fetch('/api/remove-image', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({ url }),
-      });
-
-      if (response.ok) {
+      const result = await deleteGalleryRowAndFileByUrl(url);
+      if (result.removed) {
         deletedGalleryUrls.delete(url);
         changed = true;
       } else {
-        const text = await response.text();
-        console.warn('Failed to sync deleted gallery URL to server:', url, response.status, text);
-        if (response.status >= 500) {
+        // if not removed but no server error, remove from set to avoid loops
+        if (!result.error) {
+          deletedGalleryUrls.delete(url);
+          changed = true;
+        } else {
+          // server error; break and try later
           break;
         }
-        deletedGalleryUrls.delete(url);
-        changed = true;
       }
     } catch (error) {
-      console.warn('Failed to sync deleted gallery URL to server:', url, error);
+      console.warn('Failed to sync deleted gallery URL to Supabase:', url, error);
       break;
     }
   }
@@ -205,21 +340,19 @@ async function syncDeletedGalleryUrlsToServer() {
 }
 
 async function fetchServerGalleryState() {
+  // This function used by existing code; return normalized simple arrays of URLs for compatibility
   try {
-    const res = await fetch('/api/state', { cache: 'no-store' });
-    if (!res.ok) return null;
-    const json = await res.json();
+    const supState = await fetchSupabaseGalleryState();
+    if (!supState) return null;
     const normalized = { 0: [], 1: [], 2: [] };
-    if (json && json.galleryState) {
-      for (const k in json.galleryState) {
-        const idx = Number(k);
-        if (!Number.isNaN(idx) && Array.isArray(json.galleryState[k])) {
-          normalized[idx] = json.galleryState[k];
-        }
+    for (const k in supState) {
+      const idx = Number(k);
+      if (Array.isArray(supState[k])) {
+        normalized[idx] = supState[k].map((item) => item.url || (typeof item === 'string' ? item : ''));
       }
     }
     return normalized;
-  } catch {
+  } catch (err) {
     return null;
   }
 }
@@ -267,6 +400,7 @@ async function dataUrlToFile(dataUrl, filename) {
 }
 
 async function syncLocalGalleryToServer(localState) {
+  if (!supabaseClient) return localState;
   for (let index = 0; index < 3; index += 1) {
     const images = Array.isArray(localState[index]) ? localState[index] : [];
     for (let imageIndex = 0; imageIndex < images.length; imageIndex += 1) {
@@ -274,17 +408,12 @@ async function syncLocalGalleryToServer(localState) {
       if (!isDataUrl(imageUrl)) continue;
       try {
         const file = await dataUrlToFile(imageUrl, `local-upload-${index}-${Date.now()}.jpg`);
-        const form = new FormData();
-        form.append('file', file);
-        form.append('index', String(index));
-        const res = await fetch('/api/upload', { method: 'POST', body: form });
-        if (!res.ok) throw new Error('Upload failed');
-        const j = await res.json();
-        if (j && j.url) {
-          images[imageIndex] = j.url;
+        const uploaded = await uploadGalleryFile(file, index);
+        if (uploaded && uploaded.url) {
+          images[imageIndex] = uploaded.url;
         }
       } catch (error) {
-        console.warn('Failed to sync local gallery image to server:', error);
+        console.warn('Failed to sync local gallery image to Supabase:', error);
       }
     }
     localState[index] = images;
@@ -294,20 +423,16 @@ async function syncLocalGalleryToServer(localState) {
 }
 
 async function syncLocalHeroToServer(localHeroSrc) {
-  if (!isDataUrl(localHeroSrc)) return null;
+  if (!isDataUrl(localHeroSrc) || !supabaseClient) return null;
   try {
     const file = await dataUrlToFile(localHeroSrc, `hero-upload-${Date.now()}.jpg`);
-    const form = new FormData();
-    form.append('file', file);
-    const res = await fetch('/api/upload/hero', { method: 'POST', body: form });
-    if (!res.ok) throw new Error('Hero upload failed');
-    const j = await res.json();
-    if (j && j.url) {
-      saveHeroImage(j.url);
-      return j.url;
+    const url = await uploadHeroFile(file);
+    if (url) {
+      saveHeroImage(url);
+      return url;
     }
   } catch (error) {
-    console.warn('Failed to sync local hero image to server:', error);
+    console.warn('Failed to sync local hero image to Supabase:', error);
   }
   return null;
 }
@@ -338,27 +463,12 @@ async function removeGalleryImage(containerIndex, imageIndex) {
 
   if (serverAvailable && !imageUrl.startsWith('data:')) {
     try {
-      const response = await fetch('/api/remove-image', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({ index: containerIndex, url: imageUrl }),
-      });
-
-      if (!response.ok) {
-        const text = await response.text();
-        console.warn('Server delete failed:', response.status, text);
-        removeLocally();
-        await refreshGalleryStateFromServer();
-        return;
-      }
-
+      const result = await deleteGalleryRowAndFileByUrl(imageUrl);
       removeLocally();
       await refreshGalleryStateFromServer();
       return;
     } catch (error) {
-      console.warn('Failed to remove image from server:', error);
+      console.warn('Failed to remove image from Supabase:', error);
       removeLocally();
       return;
     }
@@ -366,7 +476,6 @@ async function removeGalleryImage(containerIndex, imageIndex) {
 
   removeLocally();
 }
-
 
 function refreshGalleryGrid() {
   galleryGrid.innerHTML = '';
@@ -705,23 +814,14 @@ heroUploadInput.addEventListener('change', async (event) => {
 
   if (serverAvailable) {
     try {
-      const form = new FormData();
-      form.append('file', file);
-
-      const res = await fetch('/api/upload/hero', {
-        method: 'POST',
-        body: form,
-      });
-
-      if (!res.ok) throw new Error('Hero upload failed');
-      const j = await res.json();
-      if (j && j.url) {
-        heroPhoto.src = j.url;
-        saveHeroImage(j.url);
+      const url = await uploadHeroFile(file);
+      if (url) {
+        heroPhoto.src = url;
+        saveHeroImage(url);
       }
     } catch (err) {
-      console.error('Hero upload failed; image not saved to shared storage.', err);
-      alert('Upload failed. Your hero photo was not saved to the shared server. Please try again.');
+      console.error('Hero upload failed; image not saved to Supabase.', err);
+      alert('Upload failed. Your hero photo was not saved to Supabase. Please try again.');
       return;
     }
   } else {
@@ -745,32 +845,22 @@ galleryAddInput.addEventListener('change', async (event) => {
   }
 
   if (serverAvailable) {
-    // upload each file to server with the target container index
+    // upload each file to Supabase storage and insert metadata
     for (const file of files) {
       try {
-        const form = new FormData();
-        form.append('file', file);
-        form.append('index', String(currentGalleryTarget));
-
-        const res = await fetch('/api/upload', {
-          method: 'POST',
-          body: form,
-        });
-
-        if (!res.ok) throw new Error('Upload failed');
-        const j = await res.json();
-        if (j && j.url) {
-          addGalleryImages(currentGalleryTarget, [j.url]);
+        const uploaded = await uploadGalleryFile(file, currentGalleryTarget);
+        if (uploaded && uploaded.url) {
+          addGalleryImages(currentGalleryTarget, [uploaded.url]);
         }
       } catch (err) {
-        console.error('Server upload failed; image not saved to shared storage.', err);
-        alert('Upload failed. The image was not saved to the shared server. Please try again.');
+        console.error('Supabase upload failed; image not saved to shared storage.', err);
+        alert('Upload failed. The image was not saved to Supabase. Please try again.');
         return;
       }
     }
     await refreshGalleryStateFromServer();
   } else {
-    // fallback to client-side localStorage DataURLs when the API server is unavailable
+    // fallback to client-side localStorage DataURLs when Supabase is unavailable
     for (const file of files) {
       const reader = new FileReader();
       reader.onload = () => {
@@ -799,91 +889,84 @@ function readFileAsDataUrl(file) {
   });
 }
 
-(function () {
-  (async function initSync() {
-    loadDeletedGalleryUrls();
-    let localSaved = getLocalGalleryState();
+(async function initApp() {
+  loadDeletedGalleryUrls();
+  let localSaved = getLocalGalleryState();
 
+  // Initialize Supabase client
+  supabaseClient = initSupabaseClient();
+  if (supabaseClient) {
+    serverAvailable = await testSupabaseConnection(supabaseClient);
+  } else {
+    serverAvailable = false;
+  }
+
+  if (serverAvailable) {
     try {
-      const res = await fetch('/api/state', { cache: 'no-store' });
-      if (res.ok) {
-        serverAvailable = true;
-        const json = await res.json();
-        const norm = { 0: [], 1: [], 2: [] };
-        if (json && json.galleryState) {
-          // normalize keys (server may return string keys)
-          for (const k in json.galleryState) {
-            const idx = Number(k);
-            if (!Number.isNaN(idx) && Array.isArray(json.galleryState[k])) {
-              norm[idx] = json.galleryState[k];
-            }
-          }
-        }
+      await syncDeletedGalleryUrlsToServer();
+      localSaved = await syncLocalGalleryToServer(localSaved);
 
-        await syncDeletedGalleryUrlsToServer();
-        localSaved = await syncLocalGalleryToServer(localSaved);
-        const latestServerState = (await fetchServerGalleryState()) || norm;
-        galleryState = applyDeletionFilter(mergeGalleryState(latestServerState, localSaved));
+      const supState = await fetchSupabaseGalleryState();
+      const latestServerState = supState
+        ? Object.keys(supState).reduce((acc, k) => {
+            acc[k] = supState[k].map((r) => r.url || r);
+            return acc;
+          }, { 0: [], 1: [], 2: [] })
+        : { 0: [], 1: [], 2: [] };
 
-        if (json && json.heroImage) {
-          heroPhoto.src = json.heroImage;
-          saveHeroImage(json.heroImage);
-        } else {
-          const localHero = localStorage.getItem(savedHeroImageKey);
-          if (localHero) {
-            const syncedHero = await syncLocalHeroToServer(localHero);
-            if (syncedHero) {
-              heroPhoto.src = syncedHero;
-            }
-          }
-        }
+      galleryState = applyDeletionFilter(mergeGalleryState(latestServerState, localSaved));
+
+      const heroUrl = await fetchSupabaseHero();
+      if (heroUrl) {
+        heroPhoto.src = heroUrl;
+        saveHeroImage(heroUrl);
       } else {
-        serverAvailable = false;
+        const localHero = localStorage.getItem(savedHeroImageKey);
+        if (localHero) {
+          const syncedHero = await syncLocalHeroToServer(localHero);
+          if (syncedHero) heroPhoto.src = syncedHero;
+        }
       }
-    } catch (e) {
-      serverAvailable = false;
-    }
 
-    if (!serverAvailable) {
-      loadSavedHeroImage();
-      loadSavedGalleryImages();
-    } else {
       saveGalleryImages();
       refreshGalleryGrid();
-      // start polling so other devices' uploads appear without refresh
+
+      // Poll Supabase for updates so multiple devices see changes without refresh
       setInterval(async () => {
         try {
           await syncDeletedGalleryUrlsToServer();
-          const r = await fetch('/api/state', { cache: 'no-store' });
-          if (!r.ok) return;
-          const s = await r.json();
-          if (s && s.galleryState) {
-            const norm2 = { 0: [], 1: [], 2: [] };
-            for (const k in s.galleryState) {
-              const idx = Number(k);
-              if (!Number.isNaN(idx) && Array.isArray(s.galleryState[k])) {
-                norm2[idx] = s.galleryState[k];
-              }
-            }
-            const merged = mergeGalleryState(norm2, getLocalGalleryState());
-            const filtered = applyDeletionFilter(merged);
-            const before = JSON.stringify(galleryState);
-            const after = JSON.stringify(filtered);
-            if (before !== after) {
-              galleryState = filtered;
-              saveGalleryImages();
-              saveDeletedGalleryUrls();
-              refreshGalleryGrid();
-              if (galleryPopup.classList.contains('active')) refreshPopupGrid();
-              if (popupDetail.innerHTML.trim() !== '') refreshPopupDetail();
-            }
+          const supState2 = await fetchSupabaseGalleryState();
+          if (!supState2) return;
+          const norm2 = { 0: [], 1: [], 2: [] };
+          for (const k in supState2) {
+            norm2[k] = supState2[k].map((r) => r.url || r);
+          }
+          const merged = mergeGalleryState(norm2, getLocalGalleryState());
+          const filtered = applyDeletionFilter(merged);
+          const before = JSON.stringify(galleryState);
+          const after = JSON.stringify(filtered);
+          if (before !== after) {
+            galleryState = filtered;
+            saveGalleryImages();
+            saveDeletedGalleryUrls();
+            refreshGalleryGrid();
+            if (galleryPopup.classList.contains('active')) refreshPopupGrid();
+            if (popupDetail.innerHTML.trim() !== '') refreshPopupDetail();
           }
         } catch (e) {
           /* ignore polling errors */
         }
       }, 5000);
+    } catch (e) {
+      console.warn('Error during Supabase initialization:', e);
+      serverAvailable = false;
     }
-  })();
+  }
+
+  if (!serverAvailable) {
+    loadSavedHeroImage();
+    loadSavedGalleryImages();
+  }
 })();
 
 window.addEventListener('load', () => {
